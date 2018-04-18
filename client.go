@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-type consumer struct {
+type client struct {
 	conn   io.WriteCloser
 	es     *eventSource
 	in     chan []byte
@@ -39,13 +39,13 @@ func (gc gzipConn) Close() error {
 	return gc.Conn.Close()
 }
 
-func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (*consumer, error) {
+func newclient(resp http.ResponseWriter, req *http.Request, es *eventSource) (*client, error) {
 	conn, _, err := resp.(http.Hijacker).Hijack()
 	if err != nil {
 		return nil, err
 	}
 
-	consumer := &consumer{
+	client := &client{
 		conn:   conn,
 		es:     es,
 		in:     make(chan []byte, 10),
@@ -71,7 +71,7 @@ func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (
 			return nil, err
 		}
 
-		consumer.conn = gzipConn{conn, gzip.NewWriter(conn)}
+		client.conn = gzipConn{conn, gzip.NewWriter(conn)}
 	}
 
 	if es.customHeadersFunc != nil {
@@ -100,30 +100,30 @@ func newConsumer(resp http.ResponseWriter, req *http.Request, es *eventSource) (
 		defer idleTimer.Stop()
 		for {
 			select {
-			case message, open := <-consumer.in:
+			case message, open := <-client.in:
 				if !open {
-					consumer.conn.Close()
+					client.conn.Close()
 					return
 				}
-				conn.SetWriteDeadline(time.Now().Add(consumer.es.timeout))
-				_, err := consumer.conn.Write(message)
+				conn.SetWriteDeadline(time.Now().Add(client.es.timeout))
+				_, err := client.conn.Write(message)
 				if err != nil {
 					netErr, ok := err.(net.Error)
-					if !ok || !netErr.Timeout() || consumer.es.closeOnTimeout {
-						consumer.staled = true
-						consumer.conn.Close()
-						consumer.es.staled <- consumer
+					if !ok || !netErr.Timeout() || client.es.closeOnTimeout {
+						client.staled = true
+						client.conn.Close()
+						client.es.staled <- client
 						return
 					}
 				}
 				idleTimer.Reset(es.idleTimeout)
 			case <-idleTimer.C:
-				consumer.conn.Close()
-				consumer.es.staled <- consumer
+				client.conn.Close()
+				client.es.staled <- client
 				return
 			}
 		}
 	}()
 
-	return consumer, nil
+	return client, nil
 }

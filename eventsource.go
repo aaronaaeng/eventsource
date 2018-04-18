@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/CUBigDataClass/connor.fun-Kafka/consumer"
 )
 
 type eventMessage struct {
@@ -25,8 +27,8 @@ type eventSource struct {
 	customHeadersFunc func(*http.Request) [][]byte
 
 	sink           chan message
-	staled         chan *consumer
-	add            chan *consumer
+	staled         chan *client
+	add            chan *client
 	close          chan bool
 	idleTimeout    time.Duration
 	retry          time.Duration
@@ -34,8 +36,10 @@ type eventSource struct {
 	closeOnTimeout bool
 	gzip           bool
 
-	consumersLock sync.RWMutex
-	consumers     *list.List
+	clientsLock sync.RWMutex
+	clients     *list.List
+
+	cons *consumer.Consumer
 }
 
 type Settings struct {
@@ -60,7 +64,7 @@ type Settings struct {
 	// Gzip sets whether to use gzip Content-Encoding for clients which
 	// support it.
 	//
-	// The default is false.
+	// The default is true.
 	Gzip bool
 }
 
@@ -69,7 +73,7 @@ func DefaultSettings() *Settings {
 		Timeout:        2 * time.Second,
 		CloseOnTimeout: true,
 		IdleTimeout:    30 * time.Minute,
-		Gzip:           false,
+		Gzip:           true,
 	}
 }
 
@@ -78,16 +82,16 @@ type EventSource interface {
 	// it should implement ServerHTTP method
 	http.Handler
 
-	// send message to all consumers
+	// send message to all clients
 	SendEventMessage(data, event, id string)
 
-	// send retry message to all consumers
+	// send retry message to all clients
 	SendRetryMessage(duration time.Duration)
 
-	// consumers count
-	ConsumersCount() int
+	// clients count
+	clientsCount() int
 
-	// close and clear all consumers
+	// close and clear all clients
 	Close()
 }
 
@@ -120,13 +124,13 @@ func controlProcess(es *eventSource) {
 		case em := <-es.sink:
 			message := em.prepareMessage()
 			func() {
-				es.consumersLock.RLock()
-				defer es.consumersLock.RUnlock()
+				es.clientsLock.RLock()
+				defer es.clientsLock.RUnlock()
 
-				for e := es.consumers.Front(); e != nil; e = e.Next() {
-					c := e.Value.(*consumer)
+				for e := es.clients.Front(); e != nil; e = e.Next() {
+					c := e.Value.(*client)
 
-					// Only send this message if the consumer isn't staled
+					// Only send this message if the client isn't staled
 					if !c.staled {
 						select {
 						case c.in <- message:
@@ -142,45 +146,53 @@ func controlProcess(es *eventSource) {
 			close(es.close)
 
 			func() {
-				es.consumersLock.RLock()
-				defer es.consumersLock.RUnlock()
+				es.clientsLock.RLock()
+				defer es.clientsLock.RUnlock()
 
-				for e := es.consumers.Front(); e != nil; e = e.Next() {
-					c := e.Value.(*consumer)
+				for e := es.clients.Front(); e != nil; e = e.Next() {
+					c := e.Value.(*client)
 					close(c.in)
 				}
 			}()
 
-			es.consumersLock.Lock()
-			defer es.consumersLock.Unlock()
+			es.clientsLock.Lock()
+			defer es.clientsLock.Unlock()
 
-			es.consumers.Init()
+			es.clients.Init()
 			return
 		case c := <-es.add:
 			func() {
-				es.consumersLock.Lock()
-				defer es.consumersLock.Unlock()
+				es.clientsLock.Lock()
 
-				es.consumers.PushBack(c)
+				es.clients.PushBack(c)
+
+				es.clientsLock.Unlock()
+
+				id := 0
+				for _, data := range es.cons.Data {
+					es.SendEventMessage(data, "message", string(id))
+					id++
+				}
+
 			}()
 		case c := <-es.staled:
 			toRemoveEls := make([]*list.Element, 0, 1)
 			func() {
-				es.consumersLock.RLock()
-				defer es.consumersLock.RUnlock()
+				es.clientsLock.RLock()
+				defer es.clientsLock.RUnlock()
 
-				for e := es.consumers.Front(); e != nil; e = e.Next() {
-					if e.Value.(*consumer) == c {
+				for e := es.clients.Front(); e != nil; e = e.Next() {
+					if e.Value.(*client) == c {
 						toRemoveEls = append(toRemoveEls, e)
 					}
 				}
 			}()
 			func() {
-				es.consumersLock.Lock()
-				defer es.consumersLock.Unlock()
+				es.clientsLock.Lock()
+				defer es.clientsLock.Unlock()
 
 				for _, e := range toRemoveEls {
-					es.consumers.Remove(e)
+					es.clients.Remove(e)
 				}
 			}()
 			close(c.in)
@@ -189,7 +201,7 @@ func controlProcess(es *eventSource) {
 }
 
 // New creates new EventSource instance.
-func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) EventSource {
+func New(cons *consumer.Consumer, settings *Settings, customHeadersFunc func(*http.Request) [][]byte) EventSource {
 	if settings == nil {
 		settings = DefaultSettings()
 	}
@@ -198,13 +210,14 @@ func New(settings *Settings, customHeadersFunc func(*http.Request) [][]byte) Eve
 	es.customHeadersFunc = customHeadersFunc
 	es.sink = make(chan message, 1)
 	es.close = make(chan bool)
-	es.staled = make(chan *consumer, 1)
-	es.add = make(chan *consumer)
-	es.consumers = list.New()
+	es.staled = make(chan *client, 1)
+	es.add = make(chan *client)
+	es.clients = list.New()
 	es.timeout = settings.Timeout
 	es.idleTimeout = settings.IdleTimeout
 	es.closeOnTimeout = settings.CloseOnTimeout
 	es.gzip = settings.Gzip
+	es.cons = cons
 	go controlProcess(es)
 	return es
 }
@@ -215,9 +228,9 @@ func (es *eventSource) Close() {
 
 // ServeHTTP implements http.Handler interface.
 func (es *eventSource) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
-	cons, err := newConsumer(resp, req, es)
+	cons, err := newclient(resp, req, es)
 	if err != nil {
-		log.Print("Can't create connection to a consumer: ", err)
+		log.Print("Can't create connection to a client: ", err)
 		return
 	}
 	es.add <- cons
@@ -240,9 +253,9 @@ func (es *eventSource) SendRetryMessage(t time.Duration) {
 	es.sendMessage(&retryMessage{t})
 }
 
-func (es *eventSource) ConsumersCount() int {
-	es.consumersLock.RLock()
-	defer es.consumersLock.RUnlock()
+func (es *eventSource) clientsCount() int {
+	es.clientsLock.RLock()
+	defer es.clientsLock.RUnlock()
 
-	return es.consumers.Len()
+	return es.clients.Len()
 }
