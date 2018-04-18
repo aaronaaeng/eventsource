@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/CUBigDataClass/connor.fun-Kafka/consumer"
 )
 
 type eventMessage struct {
@@ -29,6 +27,7 @@ type eventSource struct {
 	sink           chan message
 	staled         chan *client
 	add            chan *client
+	addAlert       chan bool
 	close          chan bool
 	idleTimeout    time.Duration
 	retry          time.Duration
@@ -38,8 +37,6 @@ type eventSource struct {
 
 	clientsLock sync.RWMutex
 	clients     *list.List
-
-	cons *consumer.Consumer
 }
 
 type Settings struct {
@@ -163,16 +160,10 @@ func controlProcess(es *eventSource) {
 		case c := <-es.add:
 			func() {
 				es.clientsLock.Lock()
+				defer es.clientsLock.Unlock()
 
 				es.clients.PushBack(c)
-
-				es.clientsLock.Unlock()
-
-				id := 0
-				for _, data := range es.cons.Data {
-					es.SendEventMessage(data, "message", string(id))
-					id++
-				}
+				es.addAlert <- true
 
 			}()
 		case c := <-es.staled:
@@ -201,7 +192,7 @@ func controlProcess(es *eventSource) {
 }
 
 // New creates new EventSource instance.
-func New(cons *consumer.Consumer, settings *Settings, customHeadersFunc func(*http.Request) [][]byte) EventSource {
+func New(addAlert chan bool, settings *Settings, customHeadersFunc func(*http.Request) [][]byte) EventSource {
 	if settings == nil {
 		settings = DefaultSettings()
 	}
@@ -212,12 +203,12 @@ func New(cons *consumer.Consumer, settings *Settings, customHeadersFunc func(*ht
 	es.close = make(chan bool)
 	es.staled = make(chan *client, 1)
 	es.add = make(chan *client)
+	es.addAlert = addAlert
 	es.clients = list.New()
 	es.timeout = settings.Timeout
 	es.idleTimeout = settings.IdleTimeout
 	es.closeOnTimeout = settings.CloseOnTimeout
 	es.gzip = settings.Gzip
-	es.cons = cons
 	go controlProcess(es)
 	return es
 }
